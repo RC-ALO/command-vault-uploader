@@ -1,75 +1,22 @@
-// src/app/lib/rules.ts
+import 'server-only';
+import { loadAllowedPrefixes, clampToAllowed } from './structure';
+import { parseCard } from './cards';
+
 export type TargetKey = 'operationHarmony' | 'runtimeCodex' | 'configCodex';
-
 export type DocType =
-  | 'LoopTask'
-  | 'SOP'
-  | 'OpsIntel'
-  | 'SystemHealth'
-  | 'ControlDeck'
-  | 'Operations'
-  | 'Marketing'
-  | 'PeopleHR'
-  | 'AIAutomation'
-  | 'Finance'
-  | 'Strategy'
-  | 'ContentCreative'
-  | 'Archive'
-  | 'Generic';
-
+  | 'LoopTask' | 'SOP' | 'OpsIntel' | 'SystemHealth' | 'ControlDeck'
+  | 'Operations' | 'Marketing' | 'PeopleHR' | 'AIAutomation'
+  | 'Finance' | 'Strategy' | 'ContentCreative' | 'Archive' | 'Generic';
 export type SopStatus = 'Draft' | 'Final' | 'Superseded';
 
 export interface RuleInput {
   target: TargetKey;
   filename: string;
-
-  // Optional hints (can be filled by the system—not the user UI)
-  brand?: string;      // required when target=operationHarmony
-  loopName?: string;   // used when detected LoopTask
-  sopStatus?: SopStatus; // used when detected SOP
+  brand?: string;
+  loopName?: string;
+  sopStatus?: SopStatus;
+  content?: string;
 }
-
-function sanitize(name: string) {
-  return name.replace(/[/\\]/g, '_').replace(/\.\./g, '_').trim();
-}
-
-function ymd() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-// ---- Paths
-const VAULT_ROOT = 'Command Vault';
-const OH_ROOT = 'Operation Harmony';
-const CODEX_ROOT = 'CODEX';
-const CONFIG_ROOT = 'codex';
-
-// ---- Heuristics to detect DocType from filename (very light on purpose)
-function inferDocType(filename: string, target: TargetKey): DocType {
-  const name = filename.toLowerCase();
-
-  // Strong signals for system (CODEX)
-  if (/(sop|standard|policy|procedure)/.test(name)) return 'SOP';
-  if (/(loop|codexcard|task|ticket)/.test(name)) return 'LoopTask';
-  if (/(intel|guide|training|how[- ]?to|playbook)/.test(name)) return 'OpsIntel';
-  if (/(health|log|audit|report)/.test(name)) return 'SystemHealth';
-  if (/(directive|governance|admin|rule)/.test(name)) return 'ControlDeck';
-
-  // Business area signals (Operation Harmony)
-  if (/(campaign|asset|brand|creative|logo|ad|social)/.test(name)) return 'Marketing';
-  if (/(invoice|bill|budget|forecast|p&l|profit|loss|balance)/.test(name)) return 'Finance';
-  if (/(hiring|onboard|policy|manager|hr)/.test(name)) return 'PeopleHR';
-  if (/(prompt|automation|script|workflow)/.test(name)) return 'AIAutomation';
-  if (/(okr|strategy|plan|review|decision)/.test(name)) return 'Strategy';
-  if (/(form|checklist|process|sop)/.test(name) && target === 'operationHarmony') return 'Operations';
-  if (/(content|video|blog|copy)/.test(name)) return 'ContentCreative';
-
-  // Soft defaults to keep files OUT of Archive by default
-  if (target === 'runtimeCodex') return 'OpsIntel';     // default system bucket
-  if (target === 'operationHarmony') return 'Operations'; // default business bucket
-
-  return 'Generic';
-}
-
 export interface RuleResult {
   primaryPath: string;
   suggestions: Array<{ path: string; reason: string }>;
@@ -77,30 +24,94 @@ export interface RuleResult {
   detected: { docType: DocType; sopStatus?: SopStatus; loopName?: string };
 }
 
+const VAULT = 'Command Vault';
+const OH = 'OPERATION HARMONY';
+const CODEX = 'CODEX';
+const CONFIG = 'codex';
+const ALLOWED = loadAllowedPrefixes();
+
+const todayIso = () => new Date().toISOString().slice(0, 10);
+const yyyy = () => new Date().toISOString().slice(0, 4);
+const mm = () => new Date().toISOString().slice(5, 7);
+const safe = (s: string) => s.replace(/[/\\]/g, '_').replace(/\.\.\//g, '').trim();
+
+// Which combos get dated subfolders?
+function datedSegment(target: TargetKey, doc: DocType): string {
+  if (target === 'runtimeCodex' && doc === 'SystemHealth') return `/${todayIso()}`; // logs
+  if (target === 'operationHarmony' && doc === 'Finance') return `/${yyyy()}/${mm()}`; // reports
+  return '';
+}
+
+// Tiny loop inference for non-cards
+function inferLoopFromFilename(name: string): string | undefined {
+  const m1 = name.match(/\bGenesis[ _-]?(\d{2})\b/i);
+  if (m1) return `Genesis_${m1[1].padStart(2, '0')}`;
+  const m2 = name.match(/\bLoop[ _-]?([A-Za-z0-9]+)\b/);
+  if (m2) return m2[1];
+  return undefined;
+}
+
+// Lightweight filename classifier
+function classify(filename: string, target: TargetKey): DocType {
+  const n = filename.toLowerCase();
+  if (/(^|[\s_-])sop([\s_-]|\.|$)|standard|procedure|policy/.test(n)) return 'SOP';
+  if (/(^|[\s_-])loop|codexcard|task|ticket/.test(n)) return 'LoopTask';
+  if (/intel|guide|training|how[- ]?to|playbook/.test(n)) return 'OpsIntel';
+  if (/health|log|audit|report/.test(n)) return 'SystemHealth';
+  if (/directive|governance|admin|rule/.test(n)) return 'ControlDeck';
+
+  if (/campaign|asset|brand|creative|logo|ad|social/.test(n)) return 'Marketing';
+  if (/invoice|budget|forecast|p&l|profit|loss|balance/.test(n)) return 'Finance';
+  if (/hiring|onboard|manager|hr/.test(n)) return 'PeopleHR';
+  if (/prompt|automation|script|workflow/.test(n)) return 'AIAutomation';
+  if (/okr|strategy|plan|review|decision/.test(n)) return 'Strategy';
+  if (/form|checklist|process/.test(n) && target === 'operationHarmony') return 'Operations';
+  if (/content|video|blog|copy/.test(n)) return 'ContentCreative';
+
+  if (target === 'runtimeCodex') return 'OpsIntel';
+  if (target === 'operationHarmony') return 'Operations';
+  return 'Generic';
+}
+
 export function computePath(input: RuleInput): RuleResult {
-  const fn = sanitize(input.filename);
-  const date = ymd();
+  const filename = safe(input.filename);
   const warnings: string[] = [];
   const suggestions: Array<{ path: string; reason: string }> = [];
 
-  // Auto-detect docType
-  const detectedDocType = inferDocType(input.filename, input.target);
+  // 1) Card-aware routing
+  if (input.content) {
+    const card = parseCard(input.content);
 
-  // If we detect SOP/LoopTask but have no status/loop, set safe defaults
-  let detectedStatus: SopStatus | undefined = input.sopStatus;
-  let detectedLoop = input.loopName;
+    if (card.kind === 'CodexCard' && card.loop) {
+      const loop = card.loop || input.loopName || 'Genesis_01';
+      const p = `${VAULT}/${CODEX}/Loops/${loop}/Active Tasks/${filename}`;
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: 'LoopTask', loopName: loop } };
+    }
 
-  if (detectedDocType === 'SOP' && !detectedStatus) detectedStatus = 'Draft';
-  if (detectedDocType === 'LoopTask' && !detectedLoop) detectedLoop = 'Genesis_01';
+    if (card.kind === 'CompletionCard') {
+      if (card.filingLocation) {
+        const withFile = card.filingLocation.endsWith(filename) ? card.filingLocation : `${card.filingLocation}/${filename}`;
+        return { primaryPath: clampToAllowed(withFile, ALLOWED), suggestions, warnings, detected: { docType: 'Generic' } };
+      }
+      const loop = card.loop || input.loopName || 'Genesis_01';
+      const fallback = `${VAULT}/${CODEX}/Loops/${loop}/Loop Wrap-Up/${filename}`;
+      return { primaryPath: clampToAllowed(fallback, ALLOWED), suggestions, warnings: ['CompletionCard without Filing Location → Loop Wrap‑Up fallback'], detected: { docType: 'Generic', loopName: loop } };
+    }
+  }
 
-  // ---- OPERATION HARMONY
+  // 2) Heuristic routing (non-cards)
+  const detected = classify(input.filename, input.target);
+  let status: SopStatus | undefined = input.sopStatus;
+  let loop = input.loopName;
+  if (detected === 'SOP' && !status) status = 'Draft';
+  if (detected === 'LoopTask' && !loop) loop = inferLoopFromFilename(input.filename);
+
   if (input.target === 'operationHarmony') {
     if (!input.brand) warnings.push('Brand is required for Operation Harmony.');
     const brand = input.brand || 'UNSPECIFIED_BRAND';
-    const base = `${VAULT_ROOT}/${OH_ROOT}/${brand}`;
+    const base = `${VAULT}/${OH}/${brand}`;
 
-    // Map business areas
-    const areaByType: Record<DocType, string> = {
+    const map: Record<DocType, string> = {
       Operations:      `${base}/Operations/Processes & Forms`,
       Marketing:       `${base}/Marketing & Branding/Assets`,
       PeopleHR:        `${base}/People & HR/Hiring & Onboarding`,
@@ -109,114 +120,82 @@ export function computePath(input: RuleInput): RuleResult {
       Strategy:        `${base}/Strategy & Leadership/Plans & OKRs`,
       ContentCreative: `${base}/Content & Creative`,
       Archive:         `${base}/Archive`,
-      // If someone drops system-ish files here, suggest CODEX
-      LoopTask:        `${VAULT_ROOT}/${CODEX_ROOT}/Loops`,
-      SOP:             `${VAULT_ROOT}/${CODEX_ROOT}/Standards & SOPs`,
-      OpsIntel:        `${VAULT_ROOT}/${CODEX_ROOT}/Ops Intelligence`,
-      SystemHealth:    `${VAULT_ROOT}/${CODEX_ROOT}/System Health`,
-      ControlDeck:     `${VAULT_ROOT}/${CODEX_ROOT}/Control Deck`,
+      LoopTask:        `${VAULT}/${CODEX}/Loops`,
+      SOP:             `${VAULT}/${CODEX}/Standards & SOPs`,
+      OpsIntel:        `${VAULT}/${CODEX}/Ops Intelligence`,
+      SystemHealth:    `${VAULT}/${CODEX}/System Health`,
+      ControlDeck:     `${VAULT}/${CODEX}/Control Deck`,
       Generic:         `${base}/Operations/Processes & Forms`,
     };
 
-    const area = areaByType[detectedDocType];
-    let primaryPath = `${area}/${date}/${fn}`;
+    const seg = datedSegment('operationHarmony', detected); // Finance → YYYY/MM
+    const proposed = `${map[detected]}${seg}/${filename}`;
+    const clamped = clampToAllowed(proposed, ALLOWED);
 
-    // Suggest move to CODEX if the detector says it's a system file
-    if (['LoopTask', 'SOP', 'OpsIntel', 'SystemHealth', 'ControlDeck'].includes(detectedDocType)) {
-      suggestions.push({
-        path: `${areaByType[detectedDocType]}/`,
-        reason: `Detected a system doc (“${detectedDocType}”). Consider routing to CODEX.`,
-      });
+    if (['LoopTask','SOP','OpsIntel','SystemHealth','ControlDeck'].includes(detected)) {
+      suggestions.push({ path: `${map[detected]}/`, reason: `Detected system doc (${detected}) — consider CODEX` });
     }
 
-    return {
-      primaryPath,
-      suggestions,
-      warnings,
-      detected: { docType: detectedDocType, sopStatus: detectedStatus, loopName: detectedLoop },
-    };
+    return { primaryPath: clamped, suggestions, warnings, detected: { docType: detected, sopStatus: status, loopName: loop } };
   }
 
-  // ---- CODEX (runtime)
   if (input.target === 'runtimeCodex') {
-    const base = `${VAULT_ROOT}/${CODEX_ROOT}`;
+    const base = `${VAULT}/${CODEX}`;
 
-    if (detectedDocType === 'LoopTask') {
-      const loop = detectedLoop || 'Genesis_01';
-      const primaryPath = `${base}/Loops/${loop}/Active Tasks/${date}/${fn}`;
-      return {
-        primaryPath,
-        suggestions,
-        warnings,
-        detected: { docType: detectedDocType, loopName: loop },
-      };
+    if (detected === 'LoopTask') {
+      if (loop) {
+        const p = `${base}/Loops/${loop}/Active Tasks/${filename}`;
+        return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected, loopName: loop } };
+      }
+      warnings.push('No loop detected — select a loop to place this under Loops.');
+      const p = `${base}/Ops Intelligence/Training & Guides/${filename}`;
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: 'OpsIntel' } };
     }
 
-    if (detectedDocType === 'SOP') {
-      const status = detectedStatus || 'Draft';
+    if (detected === 'SOP') {
       const folder =
-        status === 'Final'
-          ? 'Standards & SOPs/SOP Library'
-          : status === 'Superseded'
-          ? 'Standards & SOPs/Superseded & Archive'
-          : 'Standards & SOPs/Drafts Under Review';
-      const primaryPath = `${base}/${folder}/${date}/${fn}`;
-      return {
-        primaryPath,
-        suggestions,
-        warnings,
-        detected: { docType: detectedDocType, sopStatus: status },
-      };
+        status === 'Final' ? 'Standards & SOPs/SOP Library' :
+        status === 'Superseded' ? 'Standards & SOPs/Superseded & Archive' :
+        'Standards & SOPs/Drafts Under Review';
+      const p = `${base}/${folder}/${filename}`;
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected, sopStatus: status } };
     }
 
-    if (detectedDocType === 'OpsIntel') {
-      const primaryPath = `${base}/Ops Intelligence/Training & Guides/${date}/${fn}`;
-      return { primaryPath, suggestions, warnings, detected: { docType: detectedDocType } };
+    if (detected === 'OpsIntel') {
+      const p = `${base}/Ops Intelligence/Training & Guides/${filename}`;
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected } };
     }
 
-    if (detectedDocType === 'SystemHealth') {
-      const primaryPath = `${base}/System Health/Automation Logs/${date}/${fn}`;
-      return { primaryPath, suggestions, warnings, detected: { docType: detectedDocType } };
+    if (detected === 'SystemHealth') {
+      const p = `${base}/System Health/Automation Logs/${todayIso()}/${filename}`; // keep dates
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected } };
     }
 
-    if (detectedDocType === 'ControlDeck') {
-      const primaryPath = `${base}/Control Deck/Admin Directives/${date}/${fn}`;
-      return { primaryPath, suggestions, warnings, detected: { docType: detectedDocType } };
+    if (detected === 'ControlDeck') {
+      const p = `${base}/Control Deck/Admin Directives/${filename}`;
+      return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected } };
     }
 
-    // Default for unknown system docs -> Training & Guides (not Archive)
-    const primaryPath = `${base}/Ops Intelligence/Training & Guides/${date}/${fn}`;
-    return { primaryPath, suggestions, warnings, detected: { docType: detectedDocType } };
+    const p = `${base}/Ops Intelligence/Training & Guides/${filename}`;
+    return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: detected } };
   }
 
-  // ---- codex (config) — always ingress to validation area
   if (input.target === 'configCodex') {
-    const primaryPath = `${VAULT_ROOT}/${CONFIG_ROOT}/Schema Incoming/${date}/${fn}`;
-    return { primaryPath, suggestions, warnings, detected: { docType: 'Generic' } };
+    const p = `${VAULT}/${CONFIG}/Schema Incoming/${filename}`;
+    return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings, detected: { docType: 'Generic' } };
   }
 
-  // Fallback
-  return {
-    primaryPath: `${VAULT_ROOT}/UNROUTED/${date}/${fn}`,
-    suggestions,
-    warnings: warnings.concat('Unrecognized target; using fallback.'),
-    detected: { docType: 'Generic' },
-  };
+  const p = `${VAULT}/UNROUTED/${filename}`;
+  return { primaryPath: clampToAllowed(p, ALLOWED), suggestions, warnings: warnings.concat('Unrecognized target; using fallback.'), detected: { docType: 'Generic' } };
 }
 
-/**
- * Deep re-evaluation across ALL targets.
- * Returns the top candidate (by heuristic priority) and other suggestions.
- */
 export function rethinkAllTargets(filename: string, brand?: string) {
   const candidates: RuleResult[] = [
     computePath({ target: 'runtimeCodex', filename }),
     computePath({ target: 'operationHarmony', filename, brand }),
     computePath({ target: 'configCodex', filename }),
   ];
-  // Naive priority: CODEX > Operation Harmony > codex (config)
   const primary = candidates[0];
-  const others = candidates.slice(1).map((c) => ({ path: c.primaryPath, reason: 'Alternate target' }));
+  const others = candidates.slice(1).map(c => ({ path: c.primaryPath, reason: 'Alternate target' }));
   return { primary, others };
 }
-
