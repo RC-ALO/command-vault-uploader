@@ -14,22 +14,32 @@ const labels: Record<TargetKey, { label: string; sub: string }> = {
 
 type Suggestion = { path: string; reason: string };
 
+// Temporary test PINs (Phase 1). Phase 2: move to server-side & audit log.
+const TEST_PINS: Record<string, string> = {
+  '1066': 'Ryan Chambers',
+  '4791': 'Shukur Ali',
+};
+
 export default function UploadPage() {
   const sp = useSearchParams();
   const initial = (sp.get('target') as TargetKey) || 'operationHarmony';
 
   const [target, setTarget] = useState<TargetKey>(initial);
-  const [brand, setBrand] = useState('');
+  const [brand, setBrand] = useState(''); // only used for Operation Harmony
   const [pickedName, setPickedName] = useState<string | null>(null);
 
   const [primaryPath, setPrimaryPath] = useState('');
   const [warnings, setWarnings] = useState<string[]>([]);
   const [why, setWhy] = useState<string[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
+
+  const [preferFiling, setPreferFiling] = useState<boolean>(false);
+
+  // Re-think flow
   const [disagree, setDisagree] = useState(false);
   const [alternates, setAlternates] = useState<Suggestion[]>([]);
 
-  // Card metadata (parsed on the server)
+  // Card metadata (from API)
   const [card, setCard] = useState<{
     kind?: string;
     loop?: string;
@@ -37,21 +47,28 @@ export default function UploadPage() {
     filingLocation?: string;
   } | null>(null);
 
-  // New: prefer Filing Location (for CompletionCards)
-  const [preferFiling, setPreferFiling] = useState<boolean>(false);
+  // PIN override state
+  const [pin, setPin] = useState('');
+  const [pinOwner, setPinOwner] = useState<string | null>(null);
+  const [selectedAltIdx, setSelectedAltIdx] = useState<number>(0);
+  const [overrideApplied, setOverrideApplied] = useState<boolean>(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Keep state in sync with URL param
   useEffect(() => setTarget(initial), [initial]);
 
   const preview = async (file: File) => {
     setErrors([]);
     setWhy([]);
     setCard(null);
+    setOverrideApplied(false); // new file resets override
 
-    // Read body for .md, .markdown, .txt or any text/*
+    // Treat markdown + plain‑text as parseable card content
     const isTextLike =
       file.type.startsWith('text/') || /\.(md|markdown|txt)$/i.test(file.name);
+
+    // safety: 2 MB guard
     const content =
       isTextLike && file.size < 2_000_000 ? await file.text() : undefined;
 
@@ -62,8 +79,8 @@ export default function UploadPage() {
         target,
         filename: file.name,
         brand: target === 'operationHarmony' ? (brand || undefined) : undefined,
-        content,                  // lets server parse Codex/Completion cards
-        preferFiling: preferFiling, // toggle (server may ignore until PR‑2)
+        content,                 // lets server parse Codex/Completion cards
+        preferFiling: preferFiling, // toggle (server honors when valid)
       }),
     });
 
@@ -82,13 +99,19 @@ export default function UploadPage() {
     setPrimaryPath(json.primaryPath || '');
     setWarnings(json.warnings || []);
     setWhy(json.why || []);
-    setAlternates([]); // we compute alternates only on “disagree”
+    setAlternates([]); // fetched only when "disagree" is toggled
     setCard(json.card || null);
   };
 
   const onFileChange = async () => {
     const f = inputRef.current?.files?.[0] || null;
     setPickedName(f ? f.name : null);
+    setDisagree(false);
+    setAlternates([]);
+    setPin('');
+    setPinOwner(null);
+    setSelectedAltIdx(0);
+    setOverrideApplied(false);
     if (f) await preview(f);
     else {
       setPrimaryPath('');
@@ -100,12 +123,29 @@ export default function UploadPage() {
     }
   };
 
+  // Prefer filing toggle re-runs preview if a file is selected
+  useEffect(() => {
+    const f = inputRef.current?.files?.[0];
+    if (f) preview(f);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferFiling]);
+
+  // Brand change (only for Operation Harmony) re-runs preview if a file is selected
+  useEffect(() => {
+    if (target !== 'operationHarmony') return;
+    const f = inputRef.current?.files?.[0];
+    if (f) preview(f);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brand]);
+
   const onDisagreeToggle = async (checked: boolean) => {
     setDisagree(checked);
+    setOverrideApplied(false);
     if (!checked || !pickedName) {
       setAlternates([]);
       return;
     }
+
     const res = await fetch('/api/rethink', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -116,25 +156,33 @@ export default function UploadPage() {
       setAlternates([{ path: '—', reason: json.error || 'Rethink failed' }]);
       return;
     }
-    setAlternates([
+
+    const alts: Suggestion[] = [
       { path: json.primary.primaryPath, reason: 'System re‑evaluation (best alternate)' },
       ...(json.others || []),
-    ]);
+    ];
+    setAlternates(alts);
+    setSelectedAltIdx(0);
   };
 
-  // Re-run preview if the user toggles "prefer filing" or edits brand (and a file is selected)
-  useEffect(() => {
-    const f = inputRef.current?.files?.[0];
-    if (f) preview(f);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [preferFiling]);
+  const verifyPin = (value: string) => {
+    setPin(value);
+    const owner = TEST_PINS[value.trim()];
+    setPinOwner(owner || null);
+    if (!owner) setOverrideApplied(false);
+  };
 
-  useEffect(() => {
-    if (target !== 'operationHarmony') return;
-    const f = inputRef.current?.files?.[0];
-    if (f) preview(f);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [brand]);
+  const applyOverride = () => {
+    if (!pinOwner || alternates.length === 0) return;
+    const chosen = alternates[selectedAltIdx];
+    setPrimaryPath(chosen.path);
+    // Add a local "why" note to reflect override (client-side trace)
+    setWhy((prev) => [
+      ...prev,
+      `Override selected by ${pinOwner} (PIN) — using alternate: ${chosen.path}`,
+    ]);
+    setOverrideApplied(true);
+  };
 
   return (
     <main className="min-h-screen bg-gray-900 text-white">
@@ -155,7 +203,8 @@ export default function UploadPage() {
           <div className="text-center space-y-1">
             <h1 className="text-2xl font-semibold">Upload to Command Vault</h1>
             <p className="text-gray-300">
-              Selected target: <span className="font-bold">{labels[target].label}</span>
+              Selected target:{' '}
+              <span className="font-bold">{labels[target].label}</span>
               <span className="ml-1 text-gray-500">({labels[target].sub})</span>
             </p>
           </div>
@@ -173,12 +222,12 @@ export default function UploadPage() {
                 onChange={(e) => setBrand(e.target.value)}
               />
               <p className="mt-1 text-xs text-gray-500">
-                Brand must exist under OPERATION HARMONY per the vault structure.
+                Must match an existing brand under OPERATION HARMONY.
               </p>
             </div>
           )}
 
-          {/* Choose files */}
+          {/* Choose file(s) */}
           <div className="rounded-2xl p-6 bg-gray-800 border border-gray-700 text-center">
             <label className="block text-sm text-gray-400 mb-2">Choose file(s)</label>
             <input
@@ -202,9 +251,7 @@ export default function UploadPage() {
                 checked={preferFiling}
                 onChange={(e) => setPreferFiling(e.target.checked)}
               />
-              <span className="text-sm">
-                Prefer filing location when valid
-              </span>
+              <span className="text-sm">Prefer filing location when valid</span>
             </label>
             <div className="mt-1 text-xs text-gray-500">
               Applies to <em>CompletionCards</em>: if the card includes a 📂 Filing Location and it
@@ -216,6 +263,13 @@ export default function UploadPage() {
           <div className="rounded-2xl p-5 bg-gray-800">
             <div className="text-gray-400 text-sm">Primary Path</div>
             <div className="mt-1 font-mono break-all">{primaryPath || '—'}</div>
+
+            {overrideApplied && pinOwner && (
+              <div className="mt-2 text-xs inline-flex items-center gap-2 rounded bg-emerald-700/30 px-3 py-1">
+                <span>Override active</span>
+                <span className="font-semibold">{pinOwner}</span>
+              </div>
+            )}
 
             {warnings.length > 0 && (
               <div className="mt-2 text-sm text-yellow-300">
@@ -250,16 +304,14 @@ export default function UploadPage() {
                   {card.loop && <div>Loop: {card.loop}</div>}
                   {card.taskRef && <div>TaskRef: {card.taskRef}</div>}
                   {card.filingLocation && (
-                    <div className="break-all">
-                      Filing Location: {card.filingLocation}
-                    </div>
+                    <div className="break-all">Filing Location: {card.filingLocation}</div>
                   )}
                 </div>
               </div>
             )}
           </div>
 
-          {/* Rethink alternates */}
+          {/* Rethink + PIN override */}
           <div className="rounded-2xl p-5 bg-gray-800 space-y-3">
             <label className="inline-flex items-center gap-2">
               <input
@@ -272,20 +324,87 @@ export default function UploadPage() {
                 Don’t agree with this pathing — re‑think and show alternates
               </span>
             </label>
-            {disagree && alternates.length > 0 && (
-              <div className="text-sm">
-                <div className="text-gray-400">System suggestions</div>
-                <ul className="mt-1 list-disc list-inside space-y-1">
-                  {alternates.map((s, i) => (
-                    <li key={i}>
-                      <span className="font-mono break-all">{s.path}</span>
-                      <span className="text-gray-400"> — {s.reason}</span>
-                    </li>
-                  ))}
-                </ul>
-                <div className="mt-2 text-xs text-gray-500">
-                  Suggestions are advisory; the system still places files via
-                  the Primary Path.
+
+            {disagree && (
+              <div className="space-y-3">
+                {/* PIN entry */}
+                <div className="rounded-lg bg-gray-900/60 p-3">
+                  <div className="text-sm text-gray-300 mb-1">Override PIN</div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={pin}
+                      onChange={(e) => verifyPin(e.target.value)}
+                      placeholder="Enter PIN to unlock selection"
+                      className="flex-1 bg-gray-900 rounded-lg p-2 font-mono"
+                    />
+                    <span
+                      className={`text-xs px-2 py-1 rounded ${
+                        pinOwner
+                          ? 'bg-emerald-700/30 text-emerald-200'
+                          : 'bg-gray-700/40 text-gray-300'
+                      }`}
+                    >
+                      {pinOwner ? `PIN owner: ${pinOwner}` : 'Locked'}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-gray-500">
+                    Test PINs: 1066 (Ryan Chambers), 4791 (Shukur Ali). In Phase 2 this will be
+                    server‑verified and audited.
+                  </p>
+                </div>
+
+                {/* Alternates list */}
+                <div className="rounded-lg bg-gray-900/50 p-3">
+                  <div className="text-sm text-gray-300">System suggestions</div>
+                  {alternates.length === 0 ? (
+                    <div className="text-xs text-gray-500 mt-1">—</div>
+                  ) : (
+                    <ul className="mt-2 space-y-2">
+                      {alternates.map((s, i) => {
+                        const disabled = !pinOwner;
+                        return (
+                          <li key={i} className="flex items-start gap-2">
+                            <input
+                              type="radio"
+                              name="altPick"
+                              disabled={disabled}
+                              checked={selectedAltIdx === i}
+                              onChange={() => setSelectedAltIdx(i)}
+                              className="mt-1 h-4 w-4"
+                            />
+                            <div className={`${disabled ? 'opacity-60' : ''}`}>
+                              <div className="font-mono break-all">{s.path}</div>
+                              <div className="text-gray-400 text-xs">— {s.reason}</div>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+
+                  <div className="mt-3 flex items-center gap-2">
+                    <button
+                      disabled={!pinOwner || alternates.length === 0}
+                      onClick={applyOverride}
+                      className={`rounded-lg px-3 py-1.5 shadow ${
+                        !pinOwner || alternates.length === 0
+                          ? 'bg-gray-700 text-gray-400'
+                          : 'bg-blue-600 hover:bg-blue-500 text-white'
+                      }`}
+                    >
+                      Apply override
+                    </button>
+                    {overrideApplied && pinOwner && (
+                      <span className="text-xs text-emerald-300">
+                        Override applied by {pinOwner}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="text-xs text-gray-500">
+                  Overrides require a valid PIN and are logged locally in the preview.
+                  In Phase 2 we’ll move the PIN check + audit trail server‑side.
                 </div>
               </div>
             )}
@@ -295,4 +414,3 @@ export default function UploadPage() {
     </main>
   );
 }
-
