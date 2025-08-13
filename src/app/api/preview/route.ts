@@ -1,78 +1,206 @@
-import 'server-only';
 import { NextResponse } from 'next/server';
-import { computePath } from '../../lib/rules';
 import { validateMarkdownCard } from '../../lib/validators';
 import { parseCard } from '../../lib/cards';
-import { loadAllowedPrefixes } from '../../lib/structure'; // we only *read* the roots here
 
-export const runtime = 'nodejs';
+// NOTE: light, explicit mapping for now. We’ll push this into rules/structure later.
+type TargetKey = 'operationHarmony' | 'runtimeCodex' | 'configCodex';
+
+type PreviewBody = {
+  target: TargetKey;
+  filename: string;
+  brand?: string;
+  content?: string;            // raw text for cards (.md/.txt)
+  preferFiling?: boolean;      // UI toggle for CompletionCards
+};
+
+function safeName(s: string) {
+  // keep human-readable but remove filesystem nasties
+  return s.replace(/[<>:"\\|?*]+/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function joinPath(...parts: string[]) {
+  return parts
+    .map((p) => p.replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean)
+    .join('/');
+}
+
+/** True when a filing location is inside the allowed Command Vault tree */
+function filingIsInsideVault(path?: string) {
+  if (!path) return false;
+  const norm = path.replace(/\\/g, '/').trim();
+  return /^Command Vault\//i.test(norm); // under Command Vault root only:contentReference[oaicite:5]{index=5}
+}
+
+function computePrimaryPath(
+  target: TargetKey,
+  filename: string,
+  opts: {
+    preferFiling?: boolean;
+    cardKind?: string;
+    loop?: string;
+    filingLocation?: string;
+    brand?: string;
+  },
+  why: string[],
+  warnings: string[]
+) {
+  const name = safeName(filename);
+
+  // --- Target: CODEX runtime (/CODEX) ---
+  if (target === 'runtimeCodex') {
+    // CompletionCard can prefer Filing Location if inside vault
+    if (opts.cardKind === 'CompletionCard') {
+      if (opts.preferFiling && filingIsInsideVault(opts.filingLocation)) {
+        why.push('Card provides a 📂 Filing Location inside Command Vault; UI flag prefers it.');
+        return opts.filingLocation!;
+      }
+      if (opts.loop) {
+        // Completion usually files under the loop’s Archive or wrap-up
+        why.push('CompletionCard with loop — routing into loop Archive per lifecycle.');
+        return joinPath(
+          'Command Vault',
+          'CODEX',
+          'Loops',
+          opts.loop,
+          'Archive',
+          name
+        ); // loop archive:contentReference[oaicite:6]{index=6}
+      }
+      warnings.push('No loop detected on CompletionCard — defaulting to Ops Intelligence Archive.');
+      return joinPath(
+        'Command Vault',
+        'CODEX',
+        'Ops Intelligence',
+        'Archive',
+        name
+      ); // safe fallback:contentReference[oaicite:7]{index=7}
+    }
+
+    // CodexCard (active work) → Loops/<loop>/Active Tasks
+    if (opts.cardKind === 'CodexCard' && opts.loop) {
+      why.push('CodexCard with loop — placing under Loops/Active Tasks (working docs).');
+      return joinPath(
+        'Command Vault',
+        'CODEX',
+        'Loops',
+        opts.loop,
+        'Active Tasks',
+        name
+      ); // active tasks area:contentReference[oaicite:8]{index=8}
+    }
+
+    // Unknown or missing loop → Ops Intelligence / Training & Guides
+    why.push('Not a recognised card with loop — using Ops Intelligence/Training & Guides.');
+    return joinPath(
+      'Command Vault',
+      'CODEX',
+      'Ops Intelligence',
+      'Training & Guides',
+      name
+    ); // reference area:contentReference[oaicite:9]{index=9}
+  }
+
+  // --- Target: OPERATION HARMONY ---
+  if (target === 'operationHarmony') {
+    if (!opts.brand) {
+      warnings.push('Brand is required for Operation Harmony; using top-level Archive.');
+      return joinPath('Command Vault', 'OPERATION HARMONY', 'Archive', name);
+    }
+    // Sensible default: Operations/SOPs & Playbooks
+    why.push('Business-side doc routed under Operations/SOPs & Playbooks for the selected brand.');
+    return joinPath(
+      'Command Vault',
+      'OPERATION HARMONY',
+      opts.brand,
+      'Operations',
+      'SOPs & Playbooks',
+      name
+    ); // brand structure:contentReference[oaicite:10]{index=10}
+  }
+
+  // --- Target: configCodex (/codex) read-only for ops, still return path preview ---
+  why.push('codex (config store) is read-only to ops; preview shows intended config path.');
+  return joinPath('Command Vault', 'CODEX', 'Control Deck', 'System Configs', name); // config area:contentReference[oaicite:11]{index=11}
+}
 
 export async function POST(req: Request) {
-  const { target, filename, brand, content, preferFiling } = await req.json();
+  try {
+    const body = (await req.json()) as PreviewBody;
 
-  // 1) Validate text-like uploads as Cards (Codex/Completion) when we have content
-  let explains: { reason: string }[] = [];
-  let cardMeta:
-    | { kind?: 'CodexCard' | 'CompletionCard' | 'Unknown'; loop?: string; taskRef?: string; filingLocation?: string }
-    | null = null;
-
-  if (content) {
-    const v = validateMarkdownCard(content);
-    explains = v.explains;
-    if (!v.ok) {
+    if (!body || !body.filename || !body.target) {
       return NextResponse.json(
-        { error: 'Validation failed', errors: v.errors, explains },
+        { error: 'Missing required fields: target, filename.' },
         { status: 400 }
       );
     }
-    const card = parseCard(content);
-    cardMeta = {
-      kind: v.kind,
-      loop: card.loop,
-      taskRef: card.taskRef,
-      filingLocation: card.filingLocation,
-    };
-  }
 
-  // 2) Compute baseline path using rules (governed defaults)
-  const result = computePath({ target, filename, brand, content });
+    const warnings: string[] = [];
+    const why: string[] = [];
+    let parsedCard:
+      | { kind?: string; loop?: string; taskRef?: string; filingLocation?: string }
+      | null = null;
 
-  // 3) Build WHY trace
-  const why: string[] = [];
-  if (explains.length) why.push(...explains.map((e) => e.reason));
-  if (result.detected.docType) why.push(`Detected type: ${result.detected.docType}`);
-  if (target === 'operationHarmony' && !brand) why.push('Brand missing — please choose a brand.');
-  if (result.warnings.length) why.push(...result.warnings);
-
-  // 4) Prefer Filing Location (CompletionCards) when valid and requested
-  // CompletionCards are designed to specify their final folder via 📂 Filing Location:contentReference[oaicite:7]{index=7}.
-  const allowedRoots = loadAllowedPrefixes(); // usually: "Command Vault/", "Command Vault/CODEX/", "Command Vault/OPERATION HARMONY/", "Command Vault/codex/"
-  let primaryPath = result.primaryPath;
-
-  if (preferFiling && cardMeta?.kind === 'CompletionCard' && cardMeta.filingLocation) {
-    // Ensure filename is included in the proposed path
-    const proposed = cardMeta.filingLocation.endsWith(filename)
-      ? cardMeta.filingLocation
-      : `${cardMeta.filingLocation}/${filename}`;
-
-    // Check against governed roots from the structure doc:contentReference[oaicite:8]{index=8}.
-    const isAllowed = allowedRoots.some((root) => proposed.startsWith(root));
-    if (isAllowed) {
-      primaryPath = proposed;
-      why.push('Preferred card 📂 Filing Location was inside allowed roots — honoring the card path.');
+    // Try to parse/validate cards when content is present
+    if (body.content) {
+      const validation = validateMarkdownCard(body.content);
+      if (!validation.ok) {
+        // show friendly errors but still compute a safe fallback path
+        warnings.push('Card validation failed — see errors for details.');
+      }
+      validation.explains?.forEach((e) => why.push(e.reason));
+      // parse once to extract fields for preview panel
+      const c = parseCard(body.content);
+      parsedCard = {
+        kind: c.kind,
+        loop: c.loop,
+        taskRef: c.taskRef,
+        filingLocation: c.filingLocation,
+      };
+      // If CodexCard/CompletionCard missing loop, nudge
+      if ((c.kind === 'CodexCard' || c.kind === 'CompletionCard') && !c.loop) {
+        warnings.push('No loop detected — select a loop or fix the card header/fields.');
+      }
+      if (c.kind === 'CompletionCard' && body.preferFiling) {
+        if (c.filingLocation) {
+          if (!filingIsInsideVault(c.filingLocation)) {
+            warnings.push('Filing Location is outside Command Vault; ignoring preference.');
+          } else {
+            why.push('Prefer filing is ON and filing is inside Command Vault.');
+          }
+        } else {
+          warnings.push('Prefer filing is ON but no Filing Location is present on the card.');
+        }
+      }
     } else {
-      why.push('Card’s 📂 Filing Location is outside allowed Command Vault roots — governance kept the system path.');
+      why.push('No card content provided — using filename/target heuristics.');
     }
 
-    // Show what the card asked for, either way
-    why.push(`Card’s 📂 Filing Location: ${cardMeta.filingLocation}`);
-  }
+    const primaryPath = computePrimaryPath(
+      body.target,
+      body.filename,
+      {
+        preferFiling: body.preferFiling,
+        cardKind: parsedCard?.kind,
+        loop: parsedCard?.loop,
+        filingLocation: parsedCard?.filingLocation,
+        brand: body.brand,
+      },
+      why,
+      warnings
+    );
 
-  // 5) Return preview
-  return NextResponse.json({
-    ...result,
-    primaryPath, // may be overridden if preferFiling applied
-    why,
-    card: cardMeta,
-  });
+    return NextResponse.json({
+      primaryPath,
+      warnings,
+      why,
+      card: parsedCard,
+    });
+  } catch (e: any) {
+    return NextResponse.json(
+      { error: e?.message || 'Preview failed' },
+      { status: 500 }
+    );
+  }
 }
+
